@@ -55,6 +55,17 @@ def test_safety_car_and_extrapolation_guards():
     assert (ages["shift"].abs() <= whatif.MAX_SHIFT).all() and not ages.empty
 
 
+def test_pit_lane_start_and_retirements_are_excluded():
+    clean, stints, et = fake_race()
+    model = whatif.PaceModel(clean)
+    assert 16 in whatif.sweep(model, stints, et)["driver_number"].values
+    assert 16 not in whatif.sweep(model, stints, et, exclude={16})["driver_number"].values
+    pit_lane = stints.copy()  # driver 16 "stops" on lap 1, like a pit-lane starter
+    pit_lane.loc[(pit_lane.driver_number == 16) & (pit_lane.stint_number == 1), "lap_end"] = 1
+    pit_lane.loc[(pit_lane.driver_number == 16) & (pit_lane.stint_number == 2), "lap_start"] = 2
+    assert 16 not in whatif.sweep(model, pit_lane, et)["driver_number"].values
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
