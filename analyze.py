@@ -292,7 +292,11 @@ def main():
 
     sw = pd.DataFrame()
     try:
-        sw = whatif.sweep(whatif.PaceModel(df), stints, et, neutral_laps(rc))
+        gone = set()
+        for flag in ("dnf", "dns", "dsq"):
+            if flag in result:
+                gone |= set(result.loc[result[flag].fillna(False).astype(bool), "driver_number"])
+        sw = whatif.sweep(whatif.PaceModel(df), stints, et, neutral_laps(rc), exclude=gone)
         findings += whatif.whatif_html(sw, names)
     except Exception as exc:  # noqa: BLE001
         print(f"Skipping what-if model: {exc!r}")

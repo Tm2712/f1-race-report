@@ -13,6 +13,7 @@ from insights import _ord
 
 MAX_SHIFT = 8            # laps earlier or later to test
 MIN_STINT = 5            # shortest stint we will propose
+MIN_ACTUAL_STINT = 8     # only analyse stops between two real stints (skips pit-lane starts, early incidents)
 MIN_COMPOUND_LAPS = 30   # clean laps a compound needs before we trust its wear rate
 BOOTSTRAP = 100
 MIN_GAIN = 1.0           # seconds: smaller modelled gains are not worth reporting
@@ -60,12 +61,12 @@ def _stints(g, last):
             for r in g.sort_values("stint_number").itertuples()]
 
 
-def sweep(model, stints, et, neutral=frozenset()):
+def sweep(model, stints, et, neutral=frozenset(), exclude=frozenset()):
     """Modelled change in finish time (delta, seconds; negative = faster) for every stop moved by -8..+8 laps."""
     fin = et.sort_values("lap_number").groupby("driver_number").tail(1).set_index("driver_number")
     rows = []
     for d, g in stints.groupby("driver_number"):
-        if d not in model.di or d not in fin.index:
+        if d not in model.di or d not in fin.index or d in exclude:  # exclude: drivers who did not finish
             continue
         mine, t_fin = int(fin.loc[d, "lap_number"]), fin.loc[d, "t"]
         others = fin.drop(index=d)
@@ -77,6 +78,8 @@ def sweep(model, stints, et, neutral=frozenset()):
         for k in range(len(st) - 1):
             A, B = st[k], st[k + 1]
             if not (model.usable(A["c"]) and model.usable(B["c"])):
+                continue
+            if A["b"] - A["a"] + 1 < MIN_ACTUAL_STINT or B["b"] - B["a"] + 1 < MIN_ACTUAL_STINT:
                 continue
             stop = A["b"]
             for s in range(-MAX_SHIFT, MAX_SHIFT + 1):
@@ -128,8 +131,9 @@ def write_whatif(sw, names):
         when = "later" if r.shift > 0 else "earlier"
         move = (f"enough to move from {_ord(r.pos_actual)} to {_ord(r.pos_sim)}" if r.pos_sim < r.pos_actual
                 else "not enough to change their finishing position")
+        edge = " The best option is at the edge of the range tested, so treat this with caution." if abs(r.shift) == MAX_SHIFT else ""
         out.append(f"{who}: stopping on lap {r.new_lap} instead of {r.stop_lap} ({abs(r.shift)} laps {when}) "
-                   f"is modelled {r.gain:.1f} s (±{r.se:.1f}) faster, {move}.")
+                   f"is modelled {r.gain:.1f} s (±{r.se:.1f}) faster, {move}.{edge}")
     return out
 
 
@@ -141,7 +145,7 @@ METHOD = (
     "official result after penalties). The ± comes from refitting on 100 resampled sets of laps; it understates the "
     "true uncertainty because laps are not independent. Picking the best of up to 16 shifts flatters the result, so "
     "read gains as upper estimates. The model ignores traffic, rivals reacting, tyre cliffs and any tyre age not seen "
-    "in the race (those shifts are skipped), and stops near safety cars are excluded.</p></details>")
+    "in the race (those shifts are skipped), stops near safety cars are excluded, as are drivers who did not finish and stops that follow or precede a stint shorter than 8 laps (such as pit-lane starts).</p></details>")
 
 
 def whatif_html(sw, names):
