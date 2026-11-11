@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 import requests
 
 import insights
+import whatif
 
 ROOT = Path(__file__).parent
 DOCS, RACES = ROOT / "docs", ROOT / "docs" / "races"
@@ -162,6 +163,23 @@ def chart_strategy(stints, result, names):
     return style(fig, 620)
 
 
+def chart_whatif(sw, names, colors):
+    top = whatif.reliable(sw).head(3) if not sw.empty else sw
+    if top.empty:
+        return None
+    fig = go.Figure()
+    for r in top.itertuples():
+        d = sw[(sw.driver_number == r.driver_number) & (sw.stop == r.stop)].sort_values("shift")
+        who = names.get(r.driver_number, str(r.driver_number))
+        fig.add_trace(go.Scatter(x=d["shift"], y=-d["delta"], mode="lines+markers", name=who,
+                                 line=dict(color=colors.get(who, "#8791A3")),
+                                 error_y=dict(type="data", array=d["se"], visible=True)))
+    fig.add_hline(y=0, line_color="#101828", line_width=1)
+    fig.update_xaxes(title="Stop moved by this many laps (negative = earlier)")
+    fig.update_yaxes(title="Modelled time gained (s)")
+    return style(fig, 460)
+
+
 def chart_positions(result, grid, names):
     r = result.copy()
     for flag in ("dnf", "dns", "dsq"):
@@ -272,10 +290,18 @@ def main():
         print(f"Skipping race findings: {exc!r}")
         findings = ""
 
+    sw = pd.DataFrame()
+    try:
+        sw = whatif.sweep(whatif.PaceModel(df), stints, et, neutral_laps(rc))
+        findings += whatif.whatif_html(sw, names)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Skipping what-if model: {exc!r}")
+
     charts = [
         ("Race pace", "Spread of each driver's clean laps, fastest median first. A tall box means inconsistent pace.", chart_pace(df, colors)),
         ("Tyre degradation", "Each dot is one stint of 8+ laps. Higher means the tyre fell off faster.", chart_deg(deg) if not deg.empty else None),
         ("Strategy", "Every stint by compound, in finishing order.", chart_strategy(stints, result, names)),
+        ("Pit-lap what-if", "How much faster each driver is modelled to be if a stop moves earlier or later. Bars show model noise.", chart_whatif(sw, names, colors)),
         ("Positions gained", "Grid position minus finishing position, classified finishers only.", chart_positions(result, grid, names) if not grid.empty else None),
     ]
     charts = [(t, c, f.to_html(full_html=False, include_plotlyjs=False, config={"displayModeBar": False}))

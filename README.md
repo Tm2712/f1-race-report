@@ -32,3 +32,7 @@ Open `docs/index.html` in a browser.
   result is judged two laps after the car ahead responds. It ignores tyre offsets, traffic and team intent.
 - Pace-vs-result compares median clean-lap pace rank with finishing position and only flags gaps of 3+ places.
 - `python tests/test_insights.py` runs checks on synthetic race data (needs pandas only).
+- Pit-lap what-if (`whatif.py`): a pace model (driver pace + compound offset + wear rate + lap trend) re-times a
+  driver's stints as if a stop moved up to 8 laps. Everyone else keeps their actual times. The ± is a lap-level
+  bootstrap and understates real uncertainty; picking the best shift flatters results, so gains are upper estimates.
+  Traffic, rival reactions and tyre cliffs are not modelled. Tests: `python tests/test_whatif.py`.
