@@ -1,4 +1,5 @@
-"""Automated F1 post-race report.
+
+"""Automated F1 post-race report (data from the free OpenF1 API, no login needed).
 
 Usage:
     python analyze.py              # latest completed race
@@ -8,16 +9,18 @@ Outputs static pages into docs/ (served by GitHub Pages).
 import html
 import json
 import sys
+import time
 from pathlib import Path
 
-import fastf1
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 
 ROOT = Path(__file__).parent
-DOCS, RACES, CACHE = ROOT / "docs", ROOT / "docs" / "races", ROOT / ".cache"
+DOCS, RACES = ROOT / "docs", ROOT / "docs" / "races"
 MANIFEST = DOCS / "races.json"
+API = "https://api.openf1.org/v1"
 COMPOUNDS = {"SOFT": "#E10600", "MEDIUM": "#F2B800", "HARD": "#8791A3",
              "INTERMEDIATE": "#2E9E4F", "WET": "#2F6FDE"}
 FUEL_PER_LAP = 0.03  # seconds of lap time gained per lap of fuel burned (rough)
@@ -25,45 +28,89 @@ MIN_STINT_LAPS = 8
 PLOTLY_JS = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
 
-# ---------- choosing the race ----------
+# ---------- data (OpenF1 allows 3 requests/second and 30/minute) ----------
+def get(endpoint, **params):
+    for attempt in range(6):
+        r = requests.get(f"{API}/{endpoint}", params=params, timeout=90)
+        if r.status_code == 429:  # rate limited: wait and retry
+            time.sleep(15 * (attempt + 1))
+            continue
+        if r.status_code == 404:  # OpenF1 answers 404 when a query has no rows
+            return pd.DataFrame()
+        r.raise_for_status()
+        time.sleep(2)
+        return pd.DataFrame(r.json())
+    raise SystemExit(f"OpenF1 kept rate-limiting the request for {endpoint}.")
+
+
+def calendar(year):
+    """All non-cancelled Grand Prix races of a season, with a round number."""
+    s = get("sessions", year=year, session_name="Race")
+    if s.empty:
+        return s
+    s = s[~s["is_cancelled"].fillna(False).astype(bool)].copy()
+    s["start"] = pd.to_datetime(s["date_start"], utc=True)
+    s["end"] = pd.to_datetime(s["date_end"], utc=True)
+    s = s.sort_values("start").reset_index(drop=True)
+    s["round"] = s.index + 1
+    return s
+
+
 def latest_race():
-    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    now = pd.Timestamp.now(tz="UTC")
     for year in (now.year, now.year - 1):
-        sched = fastf1.get_event_schedule(year, include_testing=False)
-        done = sched[sched["Session5DateUtc"] + pd.Timedelta(hours=4) < now]
+        cal = calendar(year)
+        done = cal[cal["end"] + pd.Timedelta(hours=1) < now] if not cal.empty else cal
         if not done.empty:
-            return year, int(done.iloc[-1]["RoundNumber"])
+            return year, done.iloc[-1]
     raise SystemExit("No completed race found.")
 
 
 # ---------- analysis ----------
-def team_colors(results):
-    out = {}
-    for _, r in results.iterrows():
-        c = str(r.get("TeamColor") or "")
-        out[r["Abbreviation"]] = f"#{c}" if len(c) == 6 else "#8791A3"
+def neutral_laps(rc):
+    """Laps run under the safety car / VSC (plus the restart lap), from race control messages."""
+    out, start = set(), None
+    if rc.empty or "message" not in rc:
+        return out
+    for _, r in rc.sort_values("date").iterrows():
+        msg, lap = str(r["message"]).upper(), r.get("lap_number")
+        if pd.isna(lap):
+            continue
+        lap = int(lap)
+        if "DEPLOYED" in msg and "SAFETY CAR" in msg and start is None:
+            start = lap
+        elif start is not None and ("IN THIS LAP" in msg or "ENDING" in msg):
+            out.update(range(start, lap + 2))
+            start = None
     return out
 
 
-def clean_laps(laps):
-    """Green-flag racing laps only: no lap 1, pit in/out, safety cars, or slow outliers."""
-    df = pd.DataFrame(laps.pick_wo_box())
-    df = df[(df["TrackStatus"] == "1") & (df["LapNumber"] > 1)].dropna(subset=["LapTime", "TyreLife"])
-    df["t"] = df["LapTime"].dt.total_seconds()
-    df = df[df["t"] <= 1.07 * df["t"].quantile(0.10)]
-    total = laps["LapNumber"].max()
-    df["tc"] = df["t"] - FUEL_PER_LAP * (total - df["LapNumber"])  # fuel-corrected
-    return df
+def clean_laps(laps, stints, rc):
+    """Green-flag racing laps only: no lap 1, in/out laps, safety cars, or slow outliers."""
+    pit_out = laps["is_pit_out_lap"].fillna(False).astype(bool)
+    in_laps = set(zip(laps.loc[pit_out, "driver_number"], laps.loc[pit_out, "lap_number"] - 1))
+    df = laps[~pit_out].dropna(subset=["lap_duration"])
+    df = df[(df["lap_number"] > 1) & ~df["lap_number"].isin(neutral_laps(rc))]
+    df = df[[(d, l) not in in_laps for d, l in zip(df["driver_number"], df["lap_number"])]]
+
+    s = stints.copy()
+    s["lap_end"] = s["lap_end"].fillna(laps["lap_number"].max())
+    m = df.merge(s[["driver_number", "stint_number", "compound", "lap_start", "lap_end", "tyre_age_at_start"]],
+                 on="driver_number")
+    m = m[(m["lap_number"] >= m["lap_start"]) & (m["lap_number"] <= m["lap_end"])].copy()
+    m["TyreLife"] = m["tyre_age_at_start"].fillna(0) + m["lap_number"] - m["lap_start"] + 1
+    m = m[m["lap_duration"] <= 1.07 * m["lap_duration"].quantile(0.10)]
+    m["tc"] = m["lap_duration"] - FUEL_PER_LAP * (laps["lap_number"].max() - m["lap_number"])  # fuel-corrected
+    return m
 
 
 def stint_degradation(df):
     rows = []
-    for (drv, _), g in df.groupby(["Driver", "Stint"]):
-        comp = g["Compound"].iloc[0]
+    for (drv, _), g in df.groupby(["Driver", "stint_number"]):
+        comp = str(g["compound"].iloc[0]).upper()
         if len(g) < MIN_STINT_LAPS or comp not in COMPOUNDS:
             continue
-        slope = np.polyfit(g["TyreLife"], g["tc"], 1)[0]
-        rows.append({"driver": drv, "compound": comp, "slope": slope, "laps": len(g)})
+        rows.append({"driver": drv, "compound": comp, "slope": np.polyfit(g["TyreLife"], g["tc"], 1)[0]})
     return pd.DataFrame(rows)
 
 
@@ -96,26 +143,35 @@ def chart_deg(deg):
     return style(fig, 460)
 
 
-def chart_strategy(laps, results):
-    order = list(results.sort_values("Position")["Abbreviation"])
-    st = laps.groupby(["Driver", "Stint", "Compound"]).agg(start=("LapNumber", "min"), end=("LapNumber", "max")).reset_index()
+def chart_strategy(stints, result, names):
+    order = [names[n] for n in result.sort_values("position")["driver_number"] if n in names]
+    st = stints.copy()
+    st["Driver"] = st["driver_number"].map(names)
+    st["compound"] = st["compound"].astype(str).str.upper()
     fig = go.Figure()
-    for comp in [c for c in COMPOUNDS if c in set(st["Compound"])]:
-        d = st[st.Compound == comp]
-        fig.add_trace(go.Bar(y=d["Driver"], x=d["end"] - d["start"] + 1, base=d["start"] - 1, orientation="h",
-                             name=comp.title(), marker=dict(color=COMPOUNDS[comp], line=dict(color="#fff", width=2)),
-                             hovertemplate="%{y}: laps %{base}–%{customdata}<extra></extra>", customdata=d["end"]))
+    for comp in [c for c in COMPOUNDS if c in set(st["compound"])]:
+        d = st[st.compound == comp]
+        fig.add_trace(go.Bar(y=d["Driver"], x=d["lap_end"] - d["lap_start"] + 1, base=d["lap_start"] - 1,
+                             orientation="h", name=comp.title(),
+                             marker=dict(color=COMPOUNDS[comp], line=dict(color="#fff", width=2)),
+                             customdata=d["lap_end"], hovertemplate="%{y}: laps %{base}-%{customdata}<extra></extra>"))
     fig.update_yaxes(categoryorder="array", categoryarray=order, autorange="reversed")
     fig.update_xaxes(title="Lap")
     fig.update_layout(barmode="overlay")
     return style(fig, 620)
 
 
-def chart_positions(results):
-    r = results.sort_values("Position").copy()
-    grid = r["GridPosition"].replace(0, len(r))  # pit-lane starts
-    r["gain"] = grid - r["Position"]
-    fig = go.Figure(go.Bar(x=r["Abbreviation"], y=r["gain"],
+def chart_positions(result, grid, names):
+    r = result.copy()
+    for flag in ("dnf", "dns", "dsq"):
+        r = r[~r[flag].fillna(False).astype(bool)] if flag in r else r
+    r = r.dropna(subset=["position"]).sort_values("position")
+    r["grid"] = r["driver_number"].map(grid.set_index("driver_number")["position"])
+    r = r.dropna(subset=["grid"])
+    if r.empty:
+        return None
+    r["gain"] = r["grid"] - r["position"]
+    fig = go.Figure(go.Bar(x=r["driver_number"].map(names), y=r["gain"],
                            marker_color=np.where(r["gain"] >= 0, "#1F8A5B", "#E10600")))
     fig.update_yaxes(title="Places gained vs. grid")
     return style(fig, 400)
@@ -150,7 +206,7 @@ def build_race_page(meta, facts, charts):
     secs = "".join(f"<section><h2>{t}</h2><p>{c}</p>{h}</section>" for t, c, h in charts)
     body = (f'<a href="../index.html">All races</a><h1>{html.escape(meta["name"])}</h1>'
             f'<p>{meta["year"]} season, round {meta["round"]}</p><div class="facts">{fx}</div>{secs}'
-            '<footer>Data: FastF1 / official F1 timing. Fuel-corrected at 0.03 s per lap; green-flag laps only.</footer>')
+            '<footer>Data: OpenF1 (unofficial, from official F1 timing). Fuel-corrected at 0.03 s per lap; green-flag laps only.</footer>')
     return shell(meta["name"], body)
 
 
@@ -165,46 +221,63 @@ def build_index(manifest):
 
 # ---------- main ----------
 def main():
-    CACHE.mkdir(exist_ok=True)
     RACES.mkdir(parents=True, exist_ok=True)
-    fastf1.Cache.enable_cache(str(CACHE))
-    year, rnd = (int(sys.argv[1]), int(sys.argv[2])) if len(sys.argv) == 3 else latest_race()
+    if len(sys.argv) == 3:
+        year, rnd = int(sys.argv[1]), int(sys.argv[2])
+        cal = calendar(year)
+        row = cal[cal["round"] == rnd].iloc[0]
+    else:
+        year, row = latest_race()
+        rnd = int(row["round"])
     slug = f"{year}-{rnd:02d}"
     manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else []
     if len(sys.argv) < 3 and any(m["slug"] == slug for m in manifest):
         print(f"{slug} already published, nothing to do.")
         return
 
-    session = fastf1.get_session(year, rnd, "R")
-    session.load(laps=True, telemetry=False, weather=False, messages=False)
-    laps, results = session.laps, session.results
-    colors = team_colors(results)
-    df = clean_laps(laps)
+    sk, mk = int(row["session_key"]), int(row["meeting_key"])
+    meeting = get("meetings", meeting_key=mk)
+    name = meeting.iloc[0]["meeting_name"] if not meeting.empty else f"{row['country_name']} Grand Prix"
+    drivers, laps, stints = get("drivers", session_key=sk), get("laps", session_key=sk), get("stints", session_key=sk)
+    result, grid, rc = get("session_result", session_key=sk), get("starting_grid", session_key=sk), get("race_control", session_key=sk)
+    if laps.empty or stints.empty or result.empty:
+        raise SystemExit("OpenF1 does not have complete data for this race yet. Try again later.")
+
+    names = dict(zip(drivers["driver_number"], drivers["name_acronym"]))
+    full = dict(zip(drivers["driver_number"], drivers["full_name"]))
+    colors = {r["name_acronym"]: f"#{r['team_colour']}" if isinstance(r.get("team_colour"), str) else "#8791A3"
+              for _, r in drivers.iterrows()}
+    laps["Driver"] = laps["driver_number"].map(names).fillna(laps["driver_number"].astype(str))
+    stints["Driver"] = stints["driver_number"].map(names).fillna(stints["driver_number"].astype(str))
+    df = clean_laps(laps, stints, rc)
+    df["Driver"] = df["driver_number"].map(names).fillna(df["driver_number"].astype(str))
     deg = stint_degradation(df)
 
-    top = results.sort_values("Position").iloc[0]
+    top = result.sort_values("position").iloc[0]
+    winner = full.get(top["driver_number"], str(top["driver_number"]))
     med = df.groupby("Driver")["tc"].median().sort_values()
-    facts = [(top["FullName"], "Race winner"),
-             (f"{med.index[0]}, {med.iloc[1] - med.iloc[0]:.2f}s clear" if len(med) > 1 else med.index[0], "Fastest race pace (median clean lap)")]
+    facts = [(winner, "Race winner"),
+             (f"{med.index[0]}, {med.iloc[1] - med.iloc[0]:.2f}s clear" if len(med) > 1 else med.index[0],
+              "Fastest race pace (median clean lap)")]
     if not deg.empty:
         worst = deg.groupby("compound")["slope"].mean().idxmax()
-        facts.append((f"{worst.title()} · {deg[deg.compound == worst]['slope'].mean():+.3f} s/lap", "Highest average tyre wear"))
+        facts.append((f"{worst.title()} {deg[deg.compound == worst]['slope'].mean():+.3f} s/lap", "Highest average tyre wear"))
 
     charts = [
         ("Race pace", "Spread of each driver's clean laps, fastest median first. A tall box means inconsistent pace.", chart_pace(df, colors)),
         ("Tyre degradation", "Each dot is one stint of 8+ laps. Higher means the tyre fell off faster.", chart_deg(deg) if not deg.empty else None),
-        ("Strategy", "Every stint by compound, in finishing order.", chart_strategy(laps, results)),
-        ("Positions gained", "Grid position minus finishing position.", chart_positions(results)),
+        ("Strategy", "Every stint by compound, in finishing order.", chart_strategy(stints, result, names)),
+        ("Positions gained", "Grid position minus finishing position, classified finishers only.", chart_positions(result, grid, names) if not grid.empty else None),
     ]
     charts = [(t, c, f.to_html(full_html=False, include_plotlyjs=False, config={"displayModeBar": False}))
               for t, c, f in charts if f is not None]
 
-    meta = {"year": year, "round": rnd, "name": session.event["EventName"], "slug": slug, "winner": top["FullName"]}
+    meta = {"year": year, "round": rnd, "name": name, "slug": slug, "winner": winner}
     (RACES / f"{slug}.html").write_text(build_race_page(meta, facts, charts), encoding="utf-8")
     manifest = [m for m in manifest if m["slug"] != slug] + [meta]
     MANIFEST.write_text(json.dumps(manifest, indent=2))
     (DOCS / "index.html").write_text(build_index(manifest), encoding="utf-8")
-    print(f"Built {slug}: {meta['name']}")
+    print(f"Built {slug}: {name}")
 
 
 if __name__ == "__main__":
