@@ -1,4 +1,3 @@
-
 """Automated F1 post-race report (data from the free OpenF1 API, no login needed).
 
 Usage:
@@ -16,6 +15,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+
+import insights
 
 ROOT = Path(__file__).parent
 DOCS, RACES = ROOT / "docs", ROOT / "docs" / "races"
@@ -190,7 +191,7 @@ h1+p{color:var(--mute);margin:0 0 32px}
 section{background:var(--panel);border:1px solid var(--line);padding:24px;margin-bottom:24px}
 h2{font:700 30px "Barlow Condensed",sans-serif;margin:0 0 4px}section p{color:var(--mute);margin:0 0 16px;max-width:70ch}
 a{color:inherit}ul{list-style:none;padding:0}li{border-bottom:1px solid var(--line);padding:14px 0}li a{font:600 24px "Barlow Condensed",sans-serif;text-decoration:none}
-li span{display:block;color:var(--mute);font-size:15px}footer{color:var(--mute);font-size:14px;margin-top:40px}
+li span{display:block;color:var(--mute);font-size:15px}table{border-collapse:collapse;width:100%;font-size:15px}th,td{text-align:left;padding:6px 12px 6px 0;border-bottom:1px solid var(--line)}details{color:var(--mute);font-size:15px;margin-top:16px}footer{color:var(--mute);font-size:14px;margin-top:40px}
 """
 
 
@@ -201,11 +202,11 @@ def shell(title, body):
 <script src="{PLOTLY_JS}"></script><style>{CSS}</style></head><body><main>{body}</main></body></html>"""
 
 
-def build_race_page(meta, facts, charts):
+def build_race_page(meta, facts, charts, findings=""):
     fx = "".join(f"<div><b>{html.escape(a)}</b><span>{html.escape(b)}</span></div>" for a, b in facts)
     secs = "".join(f"<section><h2>{t}</h2><p>{c}</p>{h}</section>" for t, c, h in charts)
     body = (f'<a href="../index.html">All races</a><h1>{html.escape(meta["name"])}</h1>'
-            f'<p>{meta["year"]} season, round {meta["round"]}</p><div class="facts">{fx}</div>{secs}'
+            f'<p>{meta["year"]} season, round {meta["round"]}</p><div class="facts">{fx}</div>{findings}{secs}'
             '<footer>Data: OpenF1 (unofficial, from official F1 timing). Fuel-corrected at 0.03 s per lap; green-flag laps only.</footer>')
     return shell(meta["name"], body)
 
@@ -263,6 +264,14 @@ def main():
         worst = deg.groupby("compound")["slope"].mean().idxmax()
         facts.append((f"{worst.title()} {deg[deg.compound == worst]['slope'].mean():+.3f} s/lap", "Highest average tyre wear"))
 
+    try:  # findings are a bonus: never let them block the report
+        et = insights.end_times(laps)
+        uc = insights.undercut_table(et, stints, neutral_laps(rc))
+        findings = insights.findings_html(uc, insights.pace_vs_result(med, result, names), names)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Skipping race findings: {exc!r}")
+        findings = ""
+
     charts = [
         ("Race pace", "Spread of each driver's clean laps, fastest median first. A tall box means inconsistent pace.", chart_pace(df, colors)),
         ("Tyre degradation", "Each dot is one stint of 8+ laps. Higher means the tyre fell off faster.", chart_deg(deg) if not deg.empty else None),
@@ -273,7 +282,7 @@ def main():
               for t, c, f in charts if f is not None]
 
     meta = {"year": year, "round": rnd, "name": name, "slug": slug, "winner": winner}
-    (RACES / f"{slug}.html").write_text(build_race_page(meta, facts, charts), encoding="utf-8")
+    (RACES / f"{slug}.html").write_text(build_race_page(meta, facts, charts, findings), encoding="utf-8")
     manifest = [m for m in manifest if m["slug"] != slug] + [meta]
     MANIFEST.write_text(json.dumps(manifest, indent=2))
     (DOCS / "index.html").write_text(build_index(manifest), encoding="utf-8")
