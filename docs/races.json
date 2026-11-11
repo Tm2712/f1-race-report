@@ -19,5 +19,12 @@
     "name": "Singapore Grand Prix",
     "slug": "2026-17",
     "winner": "Max VERSTAPPEN"
+  },
+  {
+    "year": 2026,
+    "round": 16,
+    "name": "Bahrain Grand Prix",
+    "slug": "2026-16",
+    "winner": "Max VERSTAPPEN"
   }
 ]
